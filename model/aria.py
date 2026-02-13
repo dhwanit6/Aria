@@ -203,7 +203,7 @@ class Aria(nn.Module):
                 if self.gradient_checkpointing and self.training:
                     h, new_state, last_x = torch.utils.checkpoint.checkpoint(
                         time_block, h, rwkv_states[rwkv_idx], prev_xs[rwkv_idx],
-                        use_reentrant=False,
+                        use_reentrant=True,
                     )
                 else:
                     h, new_state, last_x = time_block(
@@ -216,7 +216,7 @@ class Aria(nn.Module):
                 if self.gradient_checkpointing and self.training:
                     h, new_kv = torch.utils.checkpoint.checkpoint(
                         time_block, h, kv_caches[attn_idx], position_offset,
-                        use_reentrant=False,
+                        use_reentrant=True,
                     )
                 else:
                     h, new_kv = time_block(h, kv_caches[attn_idx], position_offset)
@@ -226,7 +226,7 @@ class Aria(nn.Module):
             # ──── Channel mixing (MoE FFN) ────
             if self.gradient_checkpointing and self.training:
                 h = torch.utils.checkpoint.checkpoint(
-                    chan_block, h, use_reentrant=False,
+                    chan_block, h, use_reentrant=True,
                 )
             else:
                 h = chan_block(h)
