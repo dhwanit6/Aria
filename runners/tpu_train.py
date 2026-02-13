@@ -243,7 +243,7 @@ def train(
 
         for micro_step in range(grad_accum):
             if step == start_step and micro_step == 0:
-                print("  (XLA Compilation started... first step takes 2-5 minutes)")
+                print("  (XLA Step 1: Loading data...)")
 
             try:
                 x, y = next(data_iter)
@@ -254,13 +254,26 @@ def train(
             x = x.to(device)
             y = y.to(device)
 
+            if step == start_step and micro_step == 0:
+                print("  (XLA Step 1: Forward pass starting...)")
+
             with amp_ctx:
                 output = model(x, target_ids=y)
                 loss = output.loss / grad_accum
 
+            if step == start_step and micro_step == 0:
+                print("  (XLA Step 1: Backward pass starting...)")
+
             loss.backward()
+
+            if step == start_step and micro_step == 0:
+                print("  (XLA Step 1: Compiling and syncing...)")
+
             if is_tpu:
                 xm.mark_step()  # Flush micro-step graph to avoid explosion
+
+            if step == start_step and micro_step == 0:
+                print(f"  (XLA Step 1: Micro-step {micro_step+1}/{grad_accum} done)")
 
         # Clip gradients
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
