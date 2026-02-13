@@ -28,6 +28,10 @@ import torch.nn as nn
 try:
     import torch_xla
     import torch_xla.core.xla_model as xm
+    import torch_xla
+    # Fix for torch.utils.checkpoint trying to access torch.xla
+    if not hasattr(torch, "xla"):
+        torch.xla = torch_xla
     HAS_XLA = True
 except ImportError:
     HAS_XLA = False
@@ -127,7 +131,9 @@ def train(
         model = model.to(torch.bfloat16)
 
     model = model.to(device)
-    model.set_gradient_checkpointing(True)
+    # Disable gradient checkpointing on TPU for now to avoid torch.xla attribute error
+    model.set_gradient_checkpointing(not is_tpu)
+    print(f"Gradient checkpointing: {'disabled' if is_tpu else 'enabled'}")
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params/1e6:.1f}M params")
