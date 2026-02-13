@@ -342,9 +342,19 @@ def train(
 # CLI
 # ──────────────────────────────────────────────────────────────
 
+def find_file(name: str, search_dirs: list[str]) -> str | None:
+    """Search for a file across multiple directories."""
+    for d in search_dirs:
+        p = Path(d) / name
+        if p.exists():
+            return str(p)
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Aria Hindi — TPU Training")
-    parser.add_argument("--data_dir", type=str, default="data/processed")
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Dir containing train.bin and meta.json")
     parser.add_argument("--output_dir", type=str, default="checkpoints/hindi_tiny")
     parser.add_argument("--max_steps", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -355,17 +365,58 @@ def main():
     parser.add_argument("--wandb", action="store_true")
     args = parser.parse_args()
 
-    # Read vocab size from metadata
-    meta_path = Path(args.data_dir) / "meta.json"
+    # ── Robust path resolution ──
+    # Script can be run from /content/Aria, /content/Aria/train, or anywhere
+    script_dir = Path(__file__).parent.resolve()        # runners/
+    train_dir = script_dir.parent.resolve()              # train/
+    repo_root = train_dir.parent.resolve()               # Aria/
+
+    search_dirs = [
+        str(Path(args.data_dir)) if args.data_dir else "",
+        str(train_dir / "data" / "processed"),           # train/data/processed/
+        str(repo_root / "data" / "processed"),            # Aria/data/processed/
+        "data/processed",                                 # relative to CWD
+        str(Path.cwd() / "data" / "processed"),
+    ]
+
+    # Find train.bin
+    data_path = find_file("train.bin", search_dirs)
+    if data_path is None:
+        print("ERROR: Could not find train.bin in any of:")
+        for d in search_dirs:
+            if d:
+                print(f"  {d}")
+        print("\nDid you copy data from Google Drive?")
+        print("  from google.colab import drive")
+        print("  drive.mount('/content/drive')")
+        print("  !cp -r /content/drive/MyDrive/Aria/data /content/Aria/train/data")
+        sys.exit(1)
+
+    data_dir = str(Path(data_path).parent)
+    print(f"✓ Found data: {data_path}")
+
+    # Find meta.json (same dir as train.bin)
+    meta_path = Path(data_dir) / "meta.json"
     if meta_path.exists():
         vocab_size = json.loads(meta_path.read_text())["vocab_size"]
+        print(f"✓ Vocab size: {vocab_size} (from {meta_path})")
     else:
+        # Try to find tokenizer
+        tok_search = [
+            str(Path(data_dir).parent / "tokenizer"),    # data/tokenizer/
+            str(train_dir / "data" / "tokenizer"),
+            str(repo_root / "data" / "tokenizer"),
+            "data/tokenizer",
+        ]
+        tok_path = find_file("aria_hindi.model", tok_search)
+        if tok_path is None:
+            print("ERROR: No meta.json and no tokenizer found. Cannot determine vocab size.")
+            sys.exit(1)
         import sentencepiece as spm
         sp = spm.SentencePieceProcessor()
-        sp.load("data/tokenizer/aria_hindi.model")
+        sp.load(tok_path)
         vocab_size = sp.get_piece_size()
-
-    data_path = str(Path(args.data_dir) / "train.bin")
+        print(f"✓ Vocab size: {vocab_size} (from {tok_path})")
 
     train(
         data_path=data_path,
