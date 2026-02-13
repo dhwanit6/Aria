@@ -128,21 +128,13 @@ class RWKV7TimeMixing(nn.Module):
         # State norm bound: sqrt(d_head) is the natural scale for a D×D matrix
         max_state_norm = math.sqrt(self.d_head) * 2.0
 
-        # Truncated BPTT: detach state every N steps to prevent gradient
-        # explosion through long recurrent chains. Without this, gradients
-        # through decay^T grow exponentially for T > ~20 steps.
-        tbptt_len = 16
-
         # Process tokens sequentially (the recurrent scan)
         outputs = []
         for t in range(T):
+            # RWKV-7 recurrence step
             r_t = r[:, t, :, :]  # [B, H, D]
             k_t = k[:, t, :, :]  # [B, H, D]
             v_t = v[:, t, :, :]  # [B, H, D]
-
-            # Truncated BPTT: detach state to bound gradient chain
-            if t > 0 and t % tbptt_len == 0:
-                state = state.detach()
 
             # Delta rule state update (computed in float32 for precision)
             k_col = k_t.unsqueeze(-1).float()  # [B, H, D, 1]

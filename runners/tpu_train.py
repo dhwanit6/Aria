@@ -131,9 +131,8 @@ def train(
         model = model.to(torch.bfloat16)
 
     model = model.to(device)
-    # Disable gradient checkpointing on TPU for now to avoid torch.xla attribute error
-    model.set_gradient_checkpointing(not is_tpu)
-    print(f"Gradient checkpointing: {'disabled' if is_tpu else 'enabled'}")
+    model.set_gradient_checkpointing(True)
+    print("Gradient checkpointing: enabled (XLA-Modular mode)")
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params/1e6:.1f}M params")
@@ -260,6 +259,8 @@ def train(
                 loss = output.loss / grad_accum
 
             loss.backward()
+            if is_tpu:
+                xm.mark_step()  # Flush micro-step graph to avoid explosion
 
         # Clip gradients
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
