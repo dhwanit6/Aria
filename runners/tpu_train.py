@@ -382,15 +382,36 @@ def main():
     # Find train.bin
     data_path = find_file("train.bin", search_dirs)
     if data_path is None:
-        print("ERROR: Could not find train.bin in any of:")
-        for d in search_dirs:
-            if d:
-                print(f"  {d}")
-        print("\nDid you copy data from Google Drive?")
-        print("  from google.colab import drive")
-        print("  drive.mount('/content/drive')")
-        print("  !cp -r /content/drive/MyDrive/Aria/data /content/Aria/train/data")
-        sys.exit(1)
+        print("Data not found. Auto-downloading Hindi corpus...")
+        # Run full pipeline from train/ directory
+        os.chdir(str(train_dir))
+        print(f"  Working dir: {os.getcwd()}")
+
+        # Step 1: Download
+        print("\n[1/3] Downloading Hindi Wikipedia...")
+        ret = os.system("python -m data.download_hindi --output_dir data/raw --max_samples 100000")
+        if ret != 0:
+            print("ERROR: Download failed.")
+            sys.exit(1)
+
+        # Step 2: Train tokenizer
+        tok_model = train_dir / "data" / "tokenizer" / "aria_hindi.model"
+        if not tok_model.exists():
+            print("\n[2/3] Training tokenizer...")
+            os.system("python -m data.train_tokenizer --input data/raw/hindi_merged.txt --vocab_size 32000")
+        else:
+            print(f"\n[2/3] Tokenizer exists: {tok_model}")
+
+        # Step 3: Preprocess
+        print("\n[3/3] Preprocessing to binary...")
+        os.system(f"python -m data.preprocess --input data/raw/hindi_merged.txt --tokenizer {tok_model} --output_dir data/processed")
+
+        # Now find the data
+        data_path = str(train_dir / "data" / "processed" / "train.bin")
+        if not Path(data_path).exists():
+            print(f"ERROR: Pipeline completed but {data_path} not found.")
+            sys.exit(1)
+        print(f"\n✓ Pipeline complete: {data_path}")
 
     data_dir = str(Path(data_path).parent)
     print(f"✓ Found data: {data_path}")
