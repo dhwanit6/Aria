@@ -128,32 +128,36 @@ class RWKV7TimeMixing(nn.Module):
         # State norm bound: sqrt(d_head) is the natural scale for a D×D matrix
         max_state_norm = math.sqrt(self.d_head) * 2.0
 
+        # Move state to float32 for stable recurrence updates
+        state = state.float()
+        k = k.float()
+        v = v.float()
+        r = r.float()
+
         # Process tokens sequentially (the recurrent scan)
         outputs = []
         for t in range(T):
-            # RWKV-7 recurrence step
             r_t = r[:, t, :, :]  # [B, H, D]
             k_t = k[:, t, :, :]  # [B, H, D]
             v_t = v[:, t, :, :]  # [B, H, D]
 
-            # Delta rule state update (computed in float32 for precision)
-            k_col = k_t.unsqueeze(-1).float()  # [B, H, D, 1]
-            v_t_f = v_t.float()
-            state = state.float()
-
+            # Delta rule state update
             # prediction: S @ k → what the state thinks v should be
+            # [B, H, D, D] @ [B, H, D, 1] → [B, H, D, 1]
+            k_col = k_t.unsqueeze(-1)
             pred = torch.matmul(state, k_col).squeeze(-1)  # [B, H, D]
 
-            # error: prediction - actual (FP32 to avoid catastrophic cancellation)
-            error = pred - v_t_f  # [B, H, D]
+            # error: prediction - actual
+            error = pred - v_t # [B, H, D]
 
             # correction: outer product of error and k
-            correction = eta * error.unsqueeze(-1) * k_col.transpose(-2, -1)  # [B, H, D, D]
+            # eta is [H, 1, 1]
+            correction = eta * error.unsqueeze(-1) * k_t.unsqueeze(-2) # [B, H, D, D]
 
             # state update: decay old state, apply correction
             state = decay * state - correction
 
-            # Frobenius norm bounding (differentiable, unlike clamp)
+            # Frobenius norm bounding (differentiable)
             state_norm = state.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
             scale_factor = torch.where(
                 state_norm > max_state_norm,
@@ -161,16 +165,15 @@ class RWKV7TimeMixing(nn.Module):
                 torch.ones_like(state_norm),
             )
             state = state * scale_factor
-            state = state.to(x.dtype)
 
             # output: S @ r (what the state retrieves for receptance)
-            r_col = r_t.unsqueeze(-1)      # [B, H, D, 1]
-            wkv = torch.matmul(state, r_col).squeeze(-1)  # [B, H, D]
-
+            wkv = torch.matmul(state, r_t.unsqueeze(-1)).squeeze(-1)  # [B, H, D]
             outputs.append(wkv)
 
-        # Stack outputs: [B, T, H, D]
-        wkv_out = torch.stack(outputs, dim=1)
+        # Move back to original dtype
+        wkv_out = torch.stack(outputs, dim=1).to(x.dtype)
+        state = state.to(x.dtype)
+
         # Reshape to [B, T, C] and apply group norm
         wkv_out = wkv_out.reshape(B, T, self.d_model)
         wkv_out = self.group_norm(wkv_out.transpose(1, 2)).transpose(1, 2)
