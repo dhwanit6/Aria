@@ -1,0 +1,20 @@
+# Data (goes to Google Drive, not GitHub)
+data/raw/
+data/processed/
+data/tokenizer/
+
+# Checkpoints
+checkpoints/
+checkpoints_test/
+checkpoints_test2/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# System
+.DS_Store
+Thumbs.db
+*.swp
