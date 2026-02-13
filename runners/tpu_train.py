@@ -143,12 +143,12 @@ def train(
     # ── Data ──
     dataset = TokenDataset(data_path, seq_len=seq_len)
 
-    # XLA-compatible dataloader (no pin_memory, no persistent_workers)
+    # XLA-compatible dataloader (num_workers=0 is most stable for initial JIT)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=0,
         drop_last=True,
     )
 
@@ -243,6 +243,9 @@ def train(
             g["lr"] = lr
 
         for micro_step in range(grad_accum):
+            if step == start_step and micro_step == 0:
+                print("  (XLA Compilation started... first step takes 2-5 minutes)")
+
             try:
                 x, y = next(data_iter)
             except StopIteration:
@@ -257,9 +260,6 @@ def train(
                 loss = output.loss / grad_accum
 
             loss.backward()
-
-            if step == start_step and micro_step == 0:
-                print("  (XLA Compilation started... first step takes 2-5 minutes)")
 
         # Clip gradients
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -357,15 +357,15 @@ def main():
     parser.add_argument("--output_dir", type=str, default="checkpoints/hindi_tiny")
     parser.add_argument("--max_steps", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_accum", type=int, default=8)
-    parser.add_argument("--seq_len", type=int, default=2048)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--wandb", action="store_true")
     args = parser.parse_args()
 
     # ── Robust path resolution ──
-    # Script can be run from /content/Aria, /content/Aria/train, or anywhere
+    # [Rest of path resolution remains same...]
     script_dir = Path(__file__).parent.resolve()        # runners/
     train_dir = script_dir.parent.resolve()              # train/
     repo_root = train_dir.parent.resolve()               # Aria/
@@ -438,6 +438,7 @@ def main():
         vocab_size = sp.get_piece_size()
         print(f"✓ Vocab size: {vocab_size} (from {tok_path})")
 
+    print("\nStarting Training Runner...")
     train(
         data_path=data_path,
         vocab_size=vocab_size,
