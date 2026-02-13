@@ -242,8 +242,7 @@ def train(
         for g in optimizer.param_groups:
             g["lr"] = lr
 
-        step_loss = 0.0
-        for _ in range(grad_accum):
+        for micro_step in range(grad_accum):
             try:
                 x, y = next(data_iter)
             except StopIteration:
@@ -258,33 +257,29 @@ def train(
                 loss = output.loss / grad_accum
 
             loss.backward()
-            step_loss += loss.item()
+
+            if step == start_step and micro_step == 0:
+                print("  (XLA Compilation started... first step takes 2-5 minutes)")
 
         # Clip gradients
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-        # Optimizer step (XLA-aware)
+        # Optimizer step
         if is_tpu:
             xm.optimizer_step(optimizer)
         else:
             optimizer.step()
-
         optimizer.zero_grad()
 
         tokens_seen += tokens_per_step
-        running_loss += step_loss
 
         # ── Log every 10 steps ──
         if (step + 1) % 10 == 0:
-            # On TPU, .item() triggers execution — use it sparingly
-            if is_tpu:
-                xm.mark_step()
-
+            # Sync and get loss once every 10 steps
+            avg_loss = output.loss.item() 
             elapsed = time.time() - t_start
-            avg_loss = running_loss / 10
             ppl = math.exp(min(avg_loss, 20))
             tok_s = tokens_per_step * 10 / max(elapsed, 0.01)
-
             grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
 
             print(
@@ -299,11 +294,9 @@ def train(
                 wandb.log({
                     "loss": avg_loss, "perplexity": ppl, "lr": lr,
                     "grad_norm": grad_norm_val,
-                    "tokens_per_sec": tok_s,
-                    "tokens_M": tokens_seen / 1e6,
+                    "tokens_per_sec": tok_s, "tokens_M": tokens_seen / 1e6,
                 }, step=step + 1)
 
-            running_loss = 0.0
             t_start = time.time()
 
         # ── Save every 500 steps ──
