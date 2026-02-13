@@ -191,23 +191,14 @@ class SlidingWindowGQA(nn.Module):
         # Attention scores
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H, T, S]
 
-        # Sliding window causal mask:
-        # Query at position i can attend to key positions max(0, i-W+1) .. i
-        # This is a BANDED lower-triangular matrix.
+        # Sliding window causal mask
         if is_causal and T > 1:
-            # Row indices (queries) and column indices (keys)
-            rows = torch.arange(T, device=x.device).unsqueeze(1)  # [T, 1]
-            cols = torch.arange(S, device=x.device).unsqueeze(0)  # [1, S]
-            # Account for cache offset: query i corresponds to absolute pos (position_offset + i)
-            # Key j corresponds to absolute pos j (keys include cache)
-            abs_q = rows + (S - T)  # absolute position of each query in the key space
-            # Causal: key position <= query position
-            causal = cols <= abs_q
-            # Sliding window: key position >= query position - window + 1
-            window = cols >= (abs_q - self.window_size + 1)
-            # Combined mask
-            mask = causal & window  # [T, S]
-            attn = attn.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            idx_q = torch.arange(T, device=x.device) + (S - T)
+            idx_k = torch.arange(S, device=x.device)
+            # Causal: j <= i AND Sliding window: j >= i - window + 1
+            mask = (idx_k.unsqueeze(0) <= idx_q.unsqueeze(1)) & \
+                   (idx_k.unsqueeze(0) >= idx_q.unsqueeze(1) - self.window_size + 1)
+            attn = attn.masked_fill(~mask.view(1, 1, T, S), float("-inf"))
 
         attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
 

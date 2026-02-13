@@ -125,26 +125,22 @@ class MoEFFN(nn.Module):
         # Normalize top-k weights to sum to 1
         top_k_weights = top_k_vals / (top_k_vals.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # ──── Routed expert computation ────
-        # For top-1 routing: just one expert per token
-        routed_out = torch.zeros_like(x_flat)  # [N, C]
-
-        if self.top_k == 1:
-            # Optimized path for top-1: group tokens by expert, batch compute
-            expert_idx = top_k_indices.squeeze(-1)  # [N]
-            for i, expert in enumerate(self.routed_experts):
-                mask = expert_idx == i
-                if mask.any():
-                    routed_out[mask] = expert(x_flat[mask]) * top_k_weights[mask]
-        else:
-            # General top-k path
-            for k_idx in range(self.top_k):
-                expert_indices = top_k_indices[:, k_idx]  # [N]
-                weights = top_k_weights[:, k_idx].unsqueeze(-1)  # [N, 1]
-                for i, expert in enumerate(self.routed_experts):
-                    mask = expert_indices == i
-                    if mask.any():
-                        routed_out[mask] += expert(x_flat[mask]) * weights[mask]
+        # ── Routed expert computation (Static XLA path) ──
+        # Computing all experts and masking is actually FASTER on TPU 
+        # than dynamic grouping, as it creates a static graph. For 4 experts,
+        # it's a minor compute increase but a massive compilation win.
+        
+        # [N, n_routed, C]
+        all_expert_outputs = torch.stack([expert(x_flat) for expert in self.routed_experts], dim=1)
+        
+        # top_k_indices: [N, k] -> expand for gather
+        gather_indices = top_k_indices.unsqueeze(-1).expand(-1, -1, C) # [N, k, C]
+        
+        # [N, k, C]
+        selected_outputs = torch.gather(all_expert_outputs, 1, gather_indices)
+        
+        # [N, k, C] * [N, k, 1] -> [N, C]
+        routed_out = (selected_outputs * top_k_weights.unsqueeze(-1)).sum(dim=1)
 
         # ──── Combine ────
         output = shared_out + routed_out

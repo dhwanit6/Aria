@@ -14,6 +14,20 @@ Key XLA differences from CUDA:
 """
 import os
 import sys
+
+# ───── XLA Environment Tuning (Crucial for TPU Stability) ─────
+# Persistent cache eliminates compilation delay on restarts
+os.environ["XLA_PERSISTENT_CACHE_PATH"] = "/content/drive/MyDrive/XLA_CACHE" if os.path.exists("/content/drive") else "/tmp/xla_cache"
+# Optimize for compile speed over runtime peak (v5e specific)
+os.environ["XLA_FLAGS"] = (
+    "--xla_gpu_autotune_level=0 "
+    "--xla_enable_lazy_compilation=true "
+    "--xla_cpu_memory_limit_per_device_pcent=80 "
+)
+# IR Debugging (useful for identifying stalls)
+os.environ["XLA_IR_DEBUG"] = "1"
+os.environ["XLA_HLO_DEBUG"] = "1"
+
 import time
 import math
 import json

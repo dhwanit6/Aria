@@ -128,60 +128,61 @@ class RWKV7TimeMixing(nn.Module):
         # State norm bound: sqrt(d_head) is the natural scale for a D×D matrix
         max_state_norm = math.sqrt(self.d_head) * 2.0
 
-        # Move state to float32 for stable recurrence updates
+        # Move to float32 for stable recurrence
         state = state.float()
         k = k.float()
         v = v.float()
         r = r.float()
+        decay = decay.float()
+        eta = eta.float()
 
-        # Process tokens sequentially (the recurrent scan)
+        # ── Chunked Scan ──
+        # XLA chokes on long Python loops. We break the sequence into chunks.
+        # Inside each chunk, we can do some vectorization, but the key is
+        # that the outer loop is T/chunk_size, not T.
+        chunk_size = 32
         outputs = []
-        for t in range(T):
-            r_t = r[:, t, :, :]  # [B, H, D]
-            k_t = k[:, t, :, :]  # [B, H, D]
-            v_t = v[:, t, :, :]  # [B, H, D]
+        
+        for i in range(0, T, chunk_size):
+            curr_chunk_size = min(chunk_size, T - i)
+            
+            # Slice chunk
+            r_c = r[:, i : i + curr_chunk_size, :, :]  # [B, C, H, D]
+            k_c = k[:, i : i + curr_chunk_size, :, :]
+            v_c = v[:, i : i + curr_chunk_size, :, :]
+            
+            # Within a chunk, it is much cheaper for XLA to unroll.
+            for t in range(curr_chunk_size):
+                rt = r_c[:, t, :, :]  # [B, H, D]
+                kt = k_c[:, t, :, :]
+                vt = v_c[:, t, :, :]
+                
+                # Delta rule: S_t = decay * S_{t-1} - eta * (S_{t-1} @ kt - vt) @ kt^T
+                kt_col = kt.unsqueeze(-1)  # [B, H, D, 1]
+                pred = torch.matmul(state, kt_col).squeeze(-1)  # [B, H, D]
+                error = pred - vt
+                
+                # Correction: [B, H, D, 1] @ [B, H, 1, D] -> [B, H, D, D]
+                correction = eta * torch.matmul(error.unsqueeze(-1), kt.unsqueeze(-2))
+                state = decay * state - correction
+                
+                # Bounding
+                state_norm = state.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+                scale = torch.where(state_norm > max_state_norm, max_state_norm/state_norm, torch.ones_like(state_norm))
+                state = state * scale
+                
+                # Output retrieval
+                wkv = torch.matmul(state, rt.unsqueeze(-1)).squeeze(-1)
+                outputs.append(wkv)
 
-            # Delta rule state update
-            # prediction: S @ k → what the state thinks v should be
-            # [B, H, D, D] @ [B, H, D, 1] → [B, H, D, 1]
-            k_col = k_t.unsqueeze(-1)
-            pred = torch.matmul(state, k_col).squeeze(-1)  # [B, H, D]
-
-            # error: prediction - actual
-            error = pred - v_t # [B, H, D]
-
-            # correction: outer product of error and k
-            # eta is [H, 1, 1]
-            correction = eta * error.unsqueeze(-1) * k_t.unsqueeze(-2) # [B, H, D, D]
-
-            # state update: decay old state, apply correction
-            state = decay * state - correction
-
-            # Frobenius norm bounding (differentiable)
-            state_norm = state.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
-            scale_factor = torch.where(
-                state_norm > max_state_norm,
-                max_state_norm / state_norm,
-                torch.ones_like(state_norm),
-            )
-            state = state * scale_factor
-
-            # output: S @ r (what the state retrieves for receptance)
-            wkv = torch.matmul(state, r_t.unsqueeze(-1)).squeeze(-1)  # [B, H, D]
-            outputs.append(wkv)
-
-        # Move back to original dtype
+        # Merge and return
         wkv_out = torch.stack(outputs, dim=1).to(x.dtype)
         state = state.to(x.dtype)
 
-        # Reshape to [B, T, C] and apply group norm
+        # Reshape and finalize
         wkv_out = wkv_out.reshape(B, T, self.d_model)
         wkv_out = self.group_norm(wkv_out.transpose(1, 2)).transpose(1, 2)
-
-        # Output projection with gate
         out = self.W_o(wkv_out) * g
-
-        # Save last x for next call's token shift
         last_x = x[:, -1:, :]
 
         return out, state, last_x
