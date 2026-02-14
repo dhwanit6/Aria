@@ -75,7 +75,7 @@ def preprocess(
             doc_count += 1
 
     total_tokens = len(all_ids)
-    print(f"\nTokenized {doc_count} documents → {total_tokens:,} tokens")
+    print(f"\nTokenized {doc_count} documents -> {total_tokens:,} tokens")
     print(f"Avg tokens/doc: {total_tokens / max(doc_count, 1):.0f}")
 
     # Convert to numpy array

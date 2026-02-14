@@ -16,6 +16,7 @@ import os
 import sys
 import json
 import argparse
+import subprocess
 from pathlib import Path
 
 # Make notebook/script output visible immediately.
@@ -25,6 +26,59 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(line_buffering=True)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+def _script_paths() -> tuple[Path, Path, Path]:
+    """Return (script_dir, train_dir, repo_root)."""
+    script_dir = Path(__file__).resolve().parent
+    train_dir = script_dir.parent
+    repo_root = train_dir.parent
+    return script_dir, train_dir, repo_root
+
+
+def _resolve_path(path_str: str) -> Path:
+    """
+    Resolve an absolute/relative path against common roots.
+    Returns a best-effort path even if it does not exist yet.
+    """
+    p = Path(path_str)
+    if p.is_absolute():
+        return p
+
+    _, train_dir, repo_root = _script_paths()
+    candidates = [
+        Path.cwd() / p,
+        train_dir / p,
+        repo_root / p,
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
+
+
+def _find_tokenizer_model(data_dir: Path) -> Path | None:
+    """Find aria_hindi.model across likely locations."""
+    _, train_dir, repo_root = _script_paths()
+    candidates = [
+        data_dir.parent / "tokenizer" / "aria_hindi.model",
+        data_dir / "tokenizer" / "aria_hindi.model",
+        train_dir / "data" / "tokenizer" / "aria_hindi.model",
+        repo_root / "data" / "tokenizer" / "aria_hindi.model",
+        Path.cwd() / "data" / "tokenizer" / "aria_hindi.model",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def _run_module(module: str, args: list[str], cwd: Path) -> None:
+    """Run `python -m module ...` and raise on failure."""
+    cmd = [sys.executable, "-m", module] + args
+    proc = subprocess.run(cmd, cwd=str(cwd))
+    if proc.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
 
 
 class TokenDataset:
@@ -102,50 +156,90 @@ def setup_environment(allow_cpu: bool = False):
 
 def prepare_data(data_dir: str = "data/processed", raw_dir: str = "data/raw"):
     """Download and preprocess data if not already done."""
-    data_dir = Path(data_dir)
-    raw_dir = Path(raw_dir)
+    _, train_dir, _ = _script_paths()
+    data_dir = _resolve_path(data_dir)
+    raw_dir = _resolve_path(raw_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
     # Check if processed data already exists
     train_bin = data_dir / "train.bin"
+    meta_path = data_dir / "meta.json"
+    if train_bin.exists() and meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        print(f"[OK] Processed data found: {meta.get('train_tokens', 0):,} tokens")
+        return str(train_bin)
     if train_bin.exists():
-        meta = json.loads((data_dir / "meta.json").read_text())
-        print(f"[OK] Processed data found: {meta['train_tokens']:,} tokens")
+        print("[WARN] train.bin exists but meta.json is missing; will rebuild metadata/data.")
         return str(train_bin)
 
     print("\nNo processed data found. Running full pipeline...")
 
-    # Step 1: Download
-    print("\n[1/3] Downloading Hindi data...")
-    os.system(f"python -m data.download_hindi --output_dir {raw_dir} --max_samples 100000")
+    merged = raw_dir / "hindi_merged.txt"
+    tokenizer_dir = train_dir / "data" / "tokenizer"
+    tokenizer_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer_model = _find_tokenizer_model(data_dir)
+    if tokenizer_model is None:
+        tokenizer_model = tokenizer_dir / "aria_hindi.model"
+
+    # Step 1: Download (only if needed)
+    if not merged.exists():
+        print("\n[1/3] Downloading Hindi data...")
+        _run_module(
+            "data.download_hindi",
+            ["--output_dir", str(raw_dir), "--max_samples", "100000"],
+            cwd=train_dir,
+        )
+    else:
+        print(f"\n[1/3] Raw corpus exists: {merged}")
 
     # Step 2: Train tokenizer
-    merged = raw_dir / "hindi_merged.txt"
-    tokenizer_prefix = "data/tokenizer/aria_hindi"
-    tokenizer_model = Path(tokenizer_prefix + ".model")
     if not tokenizer_model.exists():
         print("\n[2/3] Training tokenizer...")
-        os.system(f"python -m data.train_tokenizer --input {merged} --vocab_size 32000")
+        tokenizer_prefix = str((tokenizer_model.parent / "aria_hindi").resolve())
+        _run_module(
+            "data.train_tokenizer",
+            ["--input", str(merged), "--vocab_size", "32000", "--output_prefix", tokenizer_prefix],
+            cwd=train_dir,
+        )
     else:
         print(f"[OK] Tokenizer exists: {tokenizer_model}")
 
     # Step 3: Preprocess
     print("\n[3/3] Preprocessing...")
-    os.system(f"python -m data.preprocess --input {merged} --tokenizer {tokenizer_model} --output_dir {data_dir}")
+    _run_module(
+        "data.preprocess",
+        ["--input", str(merged), "--tokenizer", str(tokenizer_model), "--output_dir", str(data_dir)],
+        cwd=train_dir,
+    )
 
-    meta = json.loads((data_dir / "meta.json").read_text())
+    if not train_bin.exists():
+        raise RuntimeError(f"Preprocess completed but missing {train_bin}")
+    if not meta_path.exists():
+        raise RuntimeError(f"Preprocess completed but missing {meta_path}")
+
+    meta = json.loads(meta_path.read_text())
     print(f"\n[OK] Data ready: {meta['train_tokens']:,} tokens")
     return str(train_bin)
 
 
 def get_vocab_size(data_dir: str = "data/processed") -> int:
     """Read vocab size from processed data metadata."""
-    meta_path = Path(data_dir) / "meta.json"
+    data_dir_p = _resolve_path(data_dir)
+    meta_path = data_dir_p / "meta.json"
     if meta_path.exists():
-        return json.loads(meta_path.read_text())["vocab_size"]
+        meta = json.loads(meta_path.read_text())
+        if "vocab_size" in meta:
+            return int(meta["vocab_size"])
     # Fallback: read directly from tokenizer
     import sentencepiece as spm
+    tokenizer_path = _find_tokenizer_model(data_dir_p)
+    if tokenizer_path is None:
+        raise FileNotFoundError(
+            f"No vocab metadata ({meta_path}) and no tokenizer found for data_dir={data_dir_p}"
+        )
     sp = spm.SentencePieceProcessor()
-    sp.load("data/tokenizer/aria_hindi.model")
+    sp.load(str(tokenizer_path))
     return sp.get_piece_size()
 
 
@@ -438,12 +532,27 @@ def main():
     seq_len = args.seq_len or auto_sl
 
     # Data
-    if not args.skip_setup:
-        data_path = prepare_data(args.data_dir)
-    else:
-        data_path = str(Path(args.data_dir) / "train.bin")
+    data_dir = _resolve_path(args.data_dir)
+    train_bin = data_dir / "train.bin"
 
-    vocab_size = get_vocab_size(args.data_dir)
+    if args.skip_setup and train_bin.exists():
+        data_path = str(train_bin)
+        print(f"[OK] Using existing data: {data_path}")
+    else:
+        if args.skip_setup and not train_bin.exists():
+            print(
+                f"[WARN] --skip_setup was set, but {train_bin} is missing. "
+                "Running data setup automatically."
+            )
+        data_path = prepare_data(str(data_dir))
+
+    try:
+        vocab_size = get_vocab_size(str(data_dir))
+    except FileNotFoundError as exc:
+        print(f"[WARN] {exc}")
+        print("[INFO] Re-running data setup to build tokenizer/meta...")
+        data_path = prepare_data(str(data_dir))
+        vocab_size = get_vocab_size(str(Path(data_path).parent))
 
     # Train
     train(
