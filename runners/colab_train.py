@@ -18,13 +18,46 @@ import json
 import argparse
 from pathlib import Path
 
+# Make notebook/script output visible immediately.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
-def setup_environment():
-    """Install dependencies and verify GPU."""
+class TokenDataset:
+    """Memory-mapped token dataset. Returns (input_ids, target_ids)."""
+
+    def __init__(self, data_path: str, seq_len: int = 2048):
+        import numpy as np
+        import torch
+
+        self.seq_len = seq_len
+        self.data = torch.from_numpy(
+            np.memmap(data_path, dtype="uint16", mode="r").copy()
+        ).long()
+        self.n_tokens = len(self.data)
+        self.n_samples = (self.n_tokens - 1) // self.seq_len
+        print(
+            f"Dataset: {self.n_tokens:,} tokens -> "
+            f"{self.n_samples:,} samples (seq_len={seq_len})"
+        )
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        start = idx * self.seq_len
+        chunk = self.data[start : start + self.seq_len + 1]
+        return chunk[:-1], chunk[1:]
+
+
+def setup_environment(allow_cpu: bool = False):
+    """Verify runtime type and suggest stable defaults."""
     print("=" * 60)
-    print("ARIA HINDI — TRAINING SETUP")
+    print("ARIA HINDI - TRAINING SETUP")
     print("=" * 60)
 
     # Check GPU
@@ -32,7 +65,7 @@ def setup_environment():
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"✓ GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+        print(f"[OK] GPU: {gpu_name} ({gpu_mem:.1f} GB)")
 
         # Determine optimal batch settings based on GPU
         if gpu_mem >= 70:  # A100/H100 80GB
@@ -45,9 +78,26 @@ def setup_environment():
             batch_size, grad_accum, seq_len = 1, 32, 512
         print(f"  Recommended: batch={batch_size}, grad_accum={grad_accum}, seq_len={seq_len}")
         return batch_size, grad_accum, seq_len
+    has_xla = False
+    try:
+        import torch_xla.core.xla_model as xm  # noqa: F401
+        has_xla = True
+    except ImportError:
+        has_xla = False
+
+    if has_xla:
+        msg = (
+            "TPU runtime detected. This script is GPU-only; use "
+            "`python runners/tpu_train.py` instead."
+        )
     else:
-        print("✗ No GPU detected. Training will be very slow.")
-        return 1, 8, 256
+        msg = "No CUDA GPU detected."
+
+    if not allow_cpu:
+        raise RuntimeError(msg + " Pass --allow_cpu to run this script on CPU.")
+
+    print(f"[WARN] {msg} Running on CPU because --allow_cpu was set.")
+    return 1, 8, 256
 
 
 def prepare_data(data_dir: str = "data/processed", raw_dir: str = "data/raw"):
@@ -59,7 +109,7 @@ def prepare_data(data_dir: str = "data/processed", raw_dir: str = "data/raw"):
     train_bin = data_dir / "train.bin"
     if train_bin.exists():
         meta = json.loads((data_dir / "meta.json").read_text())
-        print(f"✓ Processed data found: {meta['train_tokens']:,} tokens")
+        print(f"[OK] Processed data found: {meta['train_tokens']:,} tokens")
         return str(train_bin)
 
     print("\nNo processed data found. Running full pipeline...")
@@ -76,14 +126,14 @@ def prepare_data(data_dir: str = "data/processed", raw_dir: str = "data/raw"):
         print("\n[2/3] Training tokenizer...")
         os.system(f"python -m data.train_tokenizer --input {merged} --vocab_size 32000")
     else:
-        print(f"✓ Tokenizer exists: {tokenizer_model}")
+        print(f"[OK] Tokenizer exists: {tokenizer_model}")
 
     # Step 3: Preprocess
     print("\n[3/3] Preprocessing...")
     os.system(f"python -m data.preprocess --input {merged} --tokenizer {tokenizer_model} --output_dir {data_dir}")
 
     meta = json.loads((data_dir / "meta.json").read_text())
-    print(f"\n✓ Data ready: {meta['train_tokens']:,} tokens")
+    print(f"\n[OK] Data ready: {meta['train_tokens']:,} tokens")
     return str(train_bin)
 
 
@@ -131,6 +181,8 @@ def train(
     output_dir: str = "checkpoints/hindi_tiny",
     resume: str | None = None,
     use_wandb: bool = False,
+    log_interval: int = 10,
+    log_first_n_steps: int = 10,
 ):
     """Run training with proper GPU settings."""
     import torch
@@ -146,7 +198,7 @@ def train(
     config = create_config(vocab_size, seq_len)
     from model.aria import Aria
     model = Aria(config).to(device)
-    model.set_gradient_checkpointing(True)
+    model.set_gradient_checkpointing(device.type == "cuda")
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params/1e6:.1f}M params")
@@ -154,14 +206,18 @@ def train(
     print(f"Vocab: {config.vocab_size}, seq_len={config.max_seq_len}")
 
     # ── Data ──
-    from train import TokenDataset
     dataset = TokenDataset(data_path, seq_len=seq_len)
+    if len(dataset) == 0:
+        raise ValueError(
+            f"Dataset has no samples for seq_len={seq_len}. "
+            "Use a smaller --seq_len or provide more tokens."
+        )
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=min(4, os.cpu_count() or 1),
-        pin_memory=True,
+        num_workers=min(4, os.cpu_count() or 1) if device.type == "cuda" else 0,
+        pin_memory=device.type == "cuda",
         drop_last=True,
     )
 
@@ -200,7 +256,7 @@ def train(
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"] + 1
-        print(f"✓ Resumed from step {start_step}")
+        print(f"[OK] Resumed from step {start_step}")
     else:
         # Auto-resume from latest
         latest = output_dir / "latest.pt"
@@ -209,7 +265,7 @@ def train(
             model.load_state_dict(ckpt["model"])
             optimizer.load_state_dict(ckpt["optimizer"])
             start_step = ckpt["step"] + 1
-            print(f"✓ Auto-resumed from step {start_step}")
+            print(f"[OK] Auto-resumed from step {start_step}")
 
     # ── Wandb ──
     if use_wandb:
@@ -231,11 +287,11 @@ def train(
 
     print(f"\n{'='*60}")
     print(f"TRAINING START")
-    print(f"  Steps: {start_step} → {max_steps}")
+    print(f"  Steps: {start_step} -> {max_steps}")
     print(f"  Tokens/step: {tokens_per_step:,}")
     print(f"  Total tokens: ~{max_steps * tokens_per_step / 1e9:.2f}B")
     print(f"  Warmup: {warmup_steps} steps")
-    print(f"  LR: {peak_lr} → {min_lr}")
+    print(f"  LR: {peak_lr} -> {min_lr}")
     print(f"  Grad accum: {grad_accum} (effective batch = {batch_size * grad_accum})")
     print(f"{'='*60}\n")
 
@@ -246,14 +302,15 @@ def train(
     data_iter = iter(dataloader)
     tokens_seen = start_step * tokens_per_step
     running_loss = 0.0
+    steps_since_log = 0
     t_start = time.time()
 
     for step in range(start_step, max_steps):
         # LR schedule
         if step < warmup_steps:
-            lr = peak_lr * step / warmup_steps
+            lr = peak_lr * step / max(warmup_steps, 1)
         else:
-            progress = (step - warmup_steps) / (max_steps - warmup_steps)
+            progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
             lr = min_lr + 0.5 * (peak_lr - min_lr) * (1 + math.cos(math.pi * progress))
         for group in optimizer.param_groups:
             group["lr"] = lr
@@ -285,17 +342,22 @@ def train(
         running_loss += step_loss
 
         # ── Log ──
-        if (step + 1) % 10 == 0:
+        steps_since_log += 1
+        should_log = (
+            (step - start_step + 1) <= log_first_n_steps
+            or (step + 1) % max(log_interval, 1) == 0
+        )
+        if should_log:
             elapsed = time.time() - t_start
-            avg_loss = running_loss / 10
+            avg_loss = running_loss / max(steps_since_log, 1)
             ppl = math.exp(min(avg_loss, 20))
-            tok_s = tokens_per_step * 10 / elapsed
+            tok_s = tokens_per_step * steps_since_log / max(elapsed, 0.01)
 
             print(
-                f"step {step+1:>5d}/{max_steps} │ "
-                f"loss {avg_loss:.4f} │ ppl {ppl:>8.1f} │ "
-                f"lr {lr:.2e} │ gnorm {grad_norm:.2f} │ "
-                f"{tok_s:,.0f} tok/s │ {tokens_seen/1e6:.1f}M tok"
+                f"step {step+1:>5d}/{max_steps} | "
+                f"loss {avg_loss:.4f} | ppl {ppl:>8.1f} | "
+                f"lr {lr:.2e} | gnorm {grad_norm:.2f} | "
+                f"{tok_s:,.0f} tok/s | {tokens_seen/1e6:.1f}M tok"
             )
 
             if use_wandb:
@@ -307,28 +369,32 @@ def train(
                 }, step=step + 1)
 
             running_loss = 0.0
+            steps_since_log = 0
             t_start = time.time()
 
         # ── Save ──
         if (step + 1) % 500 == 0 or step == max_steps - 1:
             ckpt_path = output_dir / f"step_{step+1:06d}.pt"
-            torch.save({
-                "step": step,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "config": {k: v for k, v in config.__dict__.items()},
-                "tokens_seen": tokens_seen,
-            }, ckpt_path)
-            print(f"  → Saved: {ckpt_path}")
+            try:
+                torch.save({
+                    "step": step,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "config": {k: v for k, v in config.__dict__.items()},
+                    "tokens_seen": tokens_seen,
+                }, ckpt_path)
+                print(f"  -> Saved: {ckpt_path}")
 
-            # Always save latest for auto-resume
-            torch.save({
-                "step": step,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "config": {k: v for k, v in config.__dict__.items()},
-                "tokens_seen": tokens_seen,
-            }, output_dir / "latest.pt")
+                # Always save latest for auto-resume
+                torch.save({
+                    "step": step,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "config": {k: v for k, v in config.__dict__.items()},
+                    "tokens_seen": tokens_seen,
+                }, output_dir / "latest.pt")
+            except Exception as exc:
+                print(f"[WARN] Checkpoint save failed at step {step+1}: {exc}")
 
     print(f"\n{'='*60}")
     print(f"TRAINING COMPLETE")
@@ -353,10 +419,20 @@ def main():
     parser.add_argument("--batch_size", type=int, default=None, help="Override auto-detected batch_size")
     parser.add_argument("--grad_accum", type=int, default=None, help="Override auto-detected grad_accum")
     parser.add_argument("--seq_len", type=int, default=None, help="Override auto-detected seq_len")
+    parser.add_argument("--allow_cpu", action="store_true",
+                        help="Allow CPU training when no CUDA GPU is available.")
+    parser.add_argument("--log_interval", type=int, default=10,
+                        help="Log every N steps after warmup logging.")
+    parser.add_argument("--log_first_n_steps", type=int, default=10,
+                        help="Always log the first N training steps.")
     args = parser.parse_args()
 
     # Setup
-    auto_bs, auto_ga, auto_sl = setup_environment()
+    try:
+        auto_bs, auto_ga, auto_sl = setup_environment(allow_cpu=args.allow_cpu)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
     batch_size = args.batch_size or auto_bs
     grad_accum = args.grad_accum or auto_ga
     seq_len = args.seq_len or auto_sl
@@ -381,6 +457,8 @@ def main():
         output_dir=args.output_dir,
         resume=args.resume,
         use_wandb=args.wandb,
+        log_interval=args.log_interval,
+        log_first_n_steps=args.log_first_n_steps,
     )
 
 

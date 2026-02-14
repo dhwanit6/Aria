@@ -88,11 +88,11 @@ class AriaConfig:
         # RWKV layers: R,K,V,G,O projections
         rwkv_time = self.n_rwkv_layers * 5 * self.d_model * self.d_model
 
-        # MoE FFN per RWKV layer
+        # MoE FFN per layer (channel mixing exists after BOTH RWKV and attention blocks)
         expert_ffn = 3 * self.d_model * self.d_expert  # SwiGLU: up + gate + down
         moe_per_layer = (self.n_shared_experts + self.n_routed_experts) * expert_ffn
         moe_router = self.d_model * self.n_routed_experts
-        rwkv_moe = self.n_rwkv_layers * (moe_per_layer + moe_router)
+        all_layers_moe = self.n_layers * (moe_per_layer + moe_router)
 
         # Shared attention (1 weight set for all attn layers)
         # Q projection
@@ -102,10 +102,7 @@ class AriaConfig:
         attn_kv = 2 * self.d_model * kv_dim
         # O projection
         attn_o = self.d_model * self.d_model
-        attn_weights = attn_q + attn_kv + attn_o
-        # Attention FFN (one shared set, same SwiGLU pattern)
-        attn_ffn = 3 * self.d_model * self.d_expert * (self.n_shared_experts + self.n_routed_experts)
-        shared_attn_total = attn_weights + attn_ffn
+        shared_attn_total = attn_q + attn_kv + attn_o
 
         # Norms: 2 per layer × d_model
         norms = self.n_layers * 2 * self.d_model
@@ -116,12 +113,20 @@ class AriaConfig:
         # Draft head
         draft = 3 * self.d_model * self.d_model if self.use_draft_head else 0
 
-        total = embed + rwkv_time + rwkv_moe + shared_attn_total + norms + rwkv_misc + draft
+        total = (
+            embed
+            + rwkv_time
+            + all_layers_moe
+            + shared_attn_total
+            + norms
+            + rwkv_misc
+            + draft
+        )
 
         return {
             "embedding": embed,
             "rwkv_time_mixing": rwkv_time,
-            "rwkv_moe_ffn": rwkv_moe,
+            "rwkv_moe_ffn": all_layers_moe,
             "shared_attention": shared_attn_total,
             "norms": norms,
             "rwkv_misc": rwkv_misc,
@@ -133,7 +138,7 @@ class AriaConfig:
 # ─── Preset Configs ─────────────────────────────────────────
 
 def aria_tiny() -> AriaConfig:
-    """~200M params. For proof-of-concept on Colab."""
+    """~98M params. For proof-of-concept on Colab."""
     return AriaConfig(
         d_model=768,
         n_layers=12,
@@ -149,7 +154,7 @@ def aria_tiny() -> AriaConfig:
 
 
 def aria_small() -> AriaConfig:
-    """~520M params. For Phase 2 training."""
+    """~567M params. For Phase 2 training."""
     return AriaConfig(
         d_model=1280,
         n_layers=20,
@@ -165,7 +170,7 @@ def aria_small() -> AriaConfig:
 
 
 def aria_full() -> AriaConfig:
-    """~1.8B params. Full model for H100 training."""
+    """~2.58B params. Full model for H100 training."""
     return AriaConfig(
         d_model=2048,
         n_layers=24,

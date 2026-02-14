@@ -15,18 +15,21 @@ Key XLA differences from CUDA:
 import os
 import sys
 
+# Force line buffering so Colab output appears immediately.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
+
 # ───── XLA Environment Tuning (Crucial for TPU Stability) ─────
 # Persistent cache eliminates compilation delay on restarts
-os.environ["XLA_PERSISTENT_CACHE_PATH"] = "/content/drive/MyDrive/XLA_CACHE" if os.path.exists("/content/drive") else "/tmp/xla_cache"
+_cache_path = "/content/drive/MyDrive/XLA_CACHE" if os.path.exists("/content/drive") else "/tmp/xla_cache"
+os.environ.setdefault("XLA_PERSISTENT_CACHE_PATH", _cache_path)
 # Optimize for compile speed over runtime peak (v5e specific)
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_autotune_level=0 "
-    "--xla_enable_lazy_compilation=true "
-    "--xla_cpu_memory_limit_per_device_pcent=80 "
-)
+# Leave XLA_FLAGS untouched unless user sets it explicitly.
 # IR Debugging (useful for identifying stalls)
-os.environ["XLA_IR_DEBUG"] = "1"
-os.environ["XLA_HLO_DEBUG"] = "1"
+os.environ.setdefault("XLA_IR_DEBUG", "0")
+os.environ.setdefault("XLA_HLO_DEBUG", "0")
 
 import time
 import math
@@ -42,7 +45,6 @@ import torch.nn as nn
 try:
     import torch_xla
     import torch_xla.core.xla_model as xm
-    import torch_xla
     # Fix for torch.utils.checkpoint trying to access torch.xla
     if not hasattr(torch, "xla"):
         torch.xla = torch_xla
@@ -71,7 +73,7 @@ class TokenDataset(torch.utils.data.Dataset):
         ).long()
         self.n_tokens = len(self.data)
         self.n_samples = (self.n_tokens - 1) // self.seq_len
-        print(f"Dataset: {self.n_tokens:,} tokens → {self.n_samples:,} samples (seq_len={seq_len})")
+        print(f"Dataset: {self.n_tokens:,} tokens -> {self.n_samples:,} samples (seq_len={seq_len})")
 
     def __len__(self):
         return self.n_samples
@@ -121,18 +123,21 @@ def train(
     output_dir: str = "checkpoints/hindi_tiny",
     resume: str | None = None,
     use_wandb: bool = False,
+    log_interval: int = 10,
+    log_first_n_steps: int = 10,
+    gradient_checkpointing: bool | None = None,
 ):
     # ── Device ──
     if HAS_XLA:
         device = xm.xla_device()
-        print(f"✓ TPU device: {device}")
+        print(f"[OK] TPU device: {device}")
         print(f"  XLA version: {torch_xla.__version__}")
     elif torch.cuda.is_available():
         device = torch.device("cuda")
-        print(f"✓ GPU: {torch.cuda.get_device_name()}")
+        print(f"[OK] GPU: {torch.cuda.get_device_name()}")
     else:
         device = torch.device("cpu")
-        print("✗ CPU only (very slow)")
+        print("[WARN] CPU only (very slow)")
 
     is_tpu = HAS_XLA and "xla" in str(device)
 
@@ -145,8 +150,16 @@ def train(
         model = model.to(torch.bfloat16)
 
     model = model.to(device)
-    model.set_gradient_checkpointing(True)
-    print("Gradient checkpointing: enabled (XLA-Modular mode)")
+    if gradient_checkpointing is None:
+        # Default off on TPU/CPU, on for CUDA.
+        gradient_checkpointing = (device.type == "cuda")
+    model.set_gradient_checkpointing(gradient_checkpointing)
+    print(
+        "Gradient checkpointing: "
+        f"{'enabled' if gradient_checkpointing else 'disabled'}"
+    )
+    if is_tpu and gradient_checkpointing:
+        print("[WARN] Checkpointing on TPU can significantly increase compile time.")
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params/1e6:.1f}M params")
@@ -155,6 +168,11 @@ def train(
 
     # ── Data ──
     dataset = TokenDataset(data_path, seq_len=seq_len)
+    if len(dataset) == 0:
+        raise ValueError(
+            f"Dataset has no samples for seq_len={seq_len}. "
+            "Use a smaller --seq_len or provide more tokens."
+        )
 
     # XLA-compatible dataloader (num_workers=0 is most stable for initial JIT)
     dataloader = torch.utils.data.DataLoader(
@@ -198,7 +216,7 @@ def train(
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"] + 1
-        print(f"✓ Resumed from step {start_step}")
+        print(f"[OK] Resumed from step {start_step}")
         # Re-move model to device after loading
         model = model.to(device)
 
@@ -235,18 +253,20 @@ def train(
     # ── Training loop ──
     print(f"\n{'='*60}")
     print(f"TRAINING START ({'TPU' if is_tpu else device})")
-    print(f"  Steps: {start_step} → {max_steps}")
+    print(f"  Steps: {start_step} -> {max_steps}")
     print(f"  Tokens/step: {tokens_per_step:,}")
     print(f"  Total tokens: ~{max_steps * tokens_per_step / 1e9:.2f}B")
-    print(f"  Warmup: {warmup_steps} steps, LR: {peak_lr} → {min_lr}")
+    print(f"  Warmup: {warmup_steps} steps, LR: {peak_lr} -> {min_lr}")
     print(f"  Grad accum: {grad_accum} (effective batch = {batch_size * grad_accum})")
+    if is_tpu:
+        print("  Note: first TPU compile can take several minutes.")
     print(f"{'='*60}\n")
 
     model.train()
     optimizer.zero_grad()
     data_iter = iter(dataloader)
     tokens_seen = start_step * tokens_per_step
-    running_loss = 0.0
+    steps_since_log = 0
     t_start = time.time()
 
     for step in range(start_step, max_steps):
@@ -281,7 +301,7 @@ def train(
             loss.backward()
 
             if step == start_step and micro_step == 0:
-                print("  (XLA Step 1: Compiling and syncing...)")
+                print("  (XLA Step 1: Compiling and syncing... this can take a while)")
 
             if is_tpu:
                 xm.mark_step()  # Flush micro-step graph to avoid explosion
@@ -301,20 +321,24 @@ def train(
 
         tokens_seen += tokens_per_step
 
-        # ── Log every 10 steps ──
-        if (step + 1) % 10 == 0:
-            # Sync and get loss once every 10 steps
-            avg_loss = output.loss.item() 
+        # Log progress.
+        steps_since_log += 1
+        should_log = (
+            (step - start_step + 1) <= log_first_n_steps
+            or (step + 1) % max(log_interval, 1) == 0
+        )
+        if should_log:
+            avg_loss = output.loss.item()
             elapsed = time.time() - t_start
             ppl = math.exp(min(avg_loss, 20))
-            tok_s = tokens_per_step * 10 / max(elapsed, 0.01)
+            tok_s = tokens_per_step * steps_since_log / max(elapsed, 0.01)
             grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
 
             print(
-                f"step {step+1:>5d}/{max_steps} │ "
-                f"loss {avg_loss:.4f} │ ppl {ppl:>8.1f} │ "
-                f"lr {lr:.2e} │ gnorm {grad_norm_val:.2f} │ "
-                f"{tok_s:,.0f} tok/s │ {tokens_seen/1e6:.1f}M tok"
+                f"step {step+1:>5d}/{max_steps} | "
+                f"loss {avg_loss:.4f} | ppl {ppl:>8.1f} | "
+                f"lr {lr:.2e} | gnorm {grad_norm_val:.2f} | "
+                f"{tok_s:,.0f} tok/s | {tokens_seen/1e6:.1f}M tok"
             )
 
             if use_wandb:
@@ -326,6 +350,7 @@ def train(
                 }, step=step + 1)
 
             t_start = time.time()
+            steps_since_log = 0
 
         # ── Save every 500 steps ──
         if (step + 1) % 500 == 0 or step == max_steps - 1:
@@ -345,19 +370,22 @@ def train(
             }
 
             ckpt_path = out_dir / f"step_{step+1:06d}.pt"
-            torch.save(ckpt, ckpt_path)
-            torch.save(ckpt, out_dir / "latest.pt")
-            print(f"  → Saved: {ckpt_path}")
+            try:
+                torch.save(ckpt, ckpt_path)
+                torch.save(ckpt, out_dir / "latest.pt")
+                print(f"  -> Saved: {ckpt_path}")
 
-            # Backup to Drive if mounted
-            drive_dir = Path("/content/drive/MyDrive/Aria/checkpoints")
-            if drive_dir.parent.exists():
-                drive_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(ckpt, drive_dir / "latest.pt")
-                print(f"  → Backed up to Google Drive")
+                # Backup to Drive if mounted
+                drive_dir = Path("/content/drive/MyDrive/Aria/checkpoints")
+                if drive_dir.parent.exists():
+                    drive_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save(ckpt, drive_dir / "latest.pt")
+                    print("  -> Backed up to Google Drive")
+            except Exception as exc:
+                print(f"[WARN] Checkpoint save failed at step {step+1}: {exc}")
 
     print(f"\n{'='*60}")
-    print(f"TRAINING COMPLETE — {tokens_seen/1e6:.1f}M tokens processed")
+    print(f"TRAINING COMPLETE - {tokens_seen/1e6:.1f}M tokens processed")
     print(f"{'='*60}")
 
     if use_wandb:
@@ -379,7 +407,7 @@ def find_file(name: str, search_dirs: list[str]) -> str | None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Aria Hindi — TPU Training")
+    parser = argparse.ArgumentParser(description="Aria Hindi - TPU Training")
     parser.add_argument("--data_dir", type=str, default=None,
                         help="Dir containing train.bin and meta.json")
     parser.add_argument("--output_dir", type=str, default="checkpoints/hindi_tiny")
@@ -390,7 +418,27 @@ def main():
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--log_interval", type=int, default=10,
+                        help="Log every N steps after warmup logging.")
+    parser.add_argument("--log_first_n_steps", type=int, default=10,
+                        help="Always log the first N training steps.")
+    parser.add_argument("--grad_ckpt", action="store_true",
+                        help="Force-enable gradient checkpointing.")
+    parser.add_argument("--no_grad_ckpt", action="store_true",
+                        help="Force-disable gradient checkpointing.")
+    parser.add_argument("--allow_fallback", action="store_true",
+                        help="Allow CPU/GPU fallback when torch_xla is unavailable.")
     args = parser.parse_args()
+
+    if args.grad_ckpt and args.no_grad_ckpt:
+        parser.error("Use only one of --grad_ckpt or --no_grad_ckpt.")
+
+    if not HAS_XLA and not args.allow_fallback:
+        print(
+            "ERROR: torch_xla is not available. "
+            "Use a TPU runtime and install torch_xla, or pass --allow_fallback."
+        )
+        sys.exit(1)
 
     # ── Robust path resolution ──
     # [Rest of path resolution remains same...]
@@ -438,16 +486,16 @@ def main():
         if not Path(data_path).exists():
             print(f"ERROR: Pipeline completed but {data_path} not found.")
             sys.exit(1)
-        print(f"\n✓ Pipeline complete: {data_path}")
+        print(f"\n[OK] Pipeline complete: {data_path}")
 
     data_dir = str(Path(data_path).parent)
-    print(f"✓ Found data: {data_path}")
+    print(f"[OK] Found data: {data_path}")
 
     # Find meta.json (same dir as train.bin)
     meta_path = Path(data_dir) / "meta.json"
     if meta_path.exists():
         vocab_size = json.loads(meta_path.read_text())["vocab_size"]
-        print(f"✓ Vocab size: {vocab_size} (from {meta_path})")
+        print(f"[OK] Vocab size: {vocab_size} (from {meta_path})")
     else:
         # Try to find tokenizer
         tok_search = [
@@ -464,7 +512,14 @@ def main():
         sp = spm.SentencePieceProcessor()
         sp.load(tok_path)
         vocab_size = sp.get_piece_size()
-        print(f"✓ Vocab size: {vocab_size} (from {tok_path})")
+        print(f"[OK] Vocab size: {vocab_size} (from {tok_path})")
+
+    if args.grad_ckpt:
+        grad_ckpt = True
+    elif args.no_grad_ckpt:
+        grad_ckpt = False
+    else:
+        grad_ckpt = None
 
     print("\nStarting Training Runner...")
     train(
@@ -478,8 +533,14 @@ def main():
         output_dir=args.output_dir,
         resume=args.resume,
         use_wandb=args.wandb,
+        log_interval=args.log_interval,
+        log_first_n_steps=args.log_first_n_steps,
+        gradient_checkpointing=grad_ckpt,
     )
 
 
 if __name__ == "__main__":
     main()
+
+
+

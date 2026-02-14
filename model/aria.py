@@ -140,6 +140,7 @@ class Aria(nn.Module):
 
         # ──── Gradient checkpointing flag ────
         self.gradient_checkpointing = False
+        self.checkpoint_use_reentrant = False
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embedding
@@ -193,6 +194,7 @@ class Aria(nn.Module):
         attn_idx = 0
 
         total_aux_loss = torch.tensor(0.0, device=device)
+        has_aux_loss = False
         draft_logits = None
 
         for i, (time_block, chan_block) in enumerate(
@@ -203,7 +205,7 @@ class Aria(nn.Module):
                 if self.gradient_checkpointing and self.training:
                     h, new_state, last_x = torch.utils.checkpoint.checkpoint(
                         time_block, h, rwkv_states[rwkv_idx], prev_xs[rwkv_idx],
-                        use_reentrant=True,
+                        use_reentrant=self.checkpoint_use_reentrant,
                     )
                 else:
                     h, new_state, last_x = time_block(
@@ -216,7 +218,7 @@ class Aria(nn.Module):
                 if self.gradient_checkpointing and self.training:
                     h, new_kv = torch.utils.checkpoint.checkpoint(
                         time_block, h, kv_caches[attn_idx], position_offset,
-                        use_reentrant=True,
+                        use_reentrant=self.checkpoint_use_reentrant,
                     )
                 else:
                     h, new_kv = time_block(h, kv_caches[attn_idx], position_offset)
@@ -226,7 +228,7 @@ class Aria(nn.Module):
             # ──── Channel mixing (MoE FFN) ────
             if self.gradient_checkpointing and self.training:
                 h = torch.utils.checkpoint.checkpoint(
-                    chan_block, h, use_reentrant=True,
+                    chan_block, h, use_reentrant=self.checkpoint_use_reentrant,
                 )
             else:
                 h = chan_block(h)
@@ -234,6 +236,7 @@ class Aria(nn.Module):
             # Collect MoE auxiliary loss
             if chan_block.aux_loss is not None:
                 total_aux_loss = total_aux_loss + chan_block.aux_loss
+                has_aux_loss = True
 
             # ──── Draft head (at the designated layer) ────
             if (
@@ -266,7 +269,7 @@ class Aria(nn.Module):
                 )
 
             # Add auxiliary losses
-            if total_aux_loss.item() > 0:
+            if has_aux_loss:
                 loss = loss + total_aux_loss
 
             if draft_loss is not None:
@@ -277,7 +280,7 @@ class Aria(nn.Module):
             loss=loss,
             draft_logits=draft_logits,
             draft_loss=draft_loss,
-            aux_loss=total_aux_loss if total_aux_loss.item() > 0 else None,
+            aux_loss=total_aux_loss if has_aux_loss else None,
             rwkv_states=new_rwkv_states,
             kv_caches=new_kv_caches,
             prev_xs=new_prev_xs,
